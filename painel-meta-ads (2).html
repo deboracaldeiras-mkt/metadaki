@@ -889,6 +889,7 @@ td.num, th.num{text-align:right;font-family:var(--font-mono);}
   background:var(--bg-card);border:1px solid var(--border);color:var(--text);
   padding:11px 18px;border-radius:10px;font-size:13px;font-weight:500;box-shadow:var(--shadow-lg);
   z-index:100;opacity:0;pointer-events:none;transition:all .25s ease;display:flex;align-items:center;gap:9px;
+  max-width:min(480px,90vw);text-align:left;line-height:1.4;
 }
 .toast.show{opacity:1;transform:translateX(-50%) translateY(0);pointer-events:auto;}
 .toast svg{width:16px;height:16px;color:var(--positive);flex-shrink:0;}
@@ -956,7 +957,8 @@ td.num, th.num{text-align:right;font-family:var(--font-mono);}
       </div>
     </nav>
     <div class="sidebar-foot">
-      <span class="status-dot"></span>Dados carregados localmente no navegador
+      <div><span class="status-dot"></span><span id="storageStatusText">Dados carregados localmente no navegador</span></div>
+      <button class="btn btn-ghost btn-sm" id="resetDataBtn" style="margin-top:10px;width:100%;justify-content:center;color:var(--text-faint);">Restaurar dados de demonstração</button>
     </div>
   </aside>
 
@@ -2441,6 +2443,60 @@ function renderAll(){
   renderCurrentView();
 }
 
+/* ---------------- Persistência local (histórico entre sessões) ---------------- */
+const STORAGE_KEY = 'painelAdsMetaData_v1';
+
+function saveToStorage(){
+  try{
+    const payload = {
+      rows: STATE.allRows,
+      capabilities: STATE.capabilities,
+      accountName: STATE.accountName,
+      savedAt: Date.now()
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+    return true;
+  } catch(e){
+    console.warn('Não foi possível salvar os dados no navegador:', e);
+    return false;
+  }
+}
+
+function loadFromStorage(){
+  try{
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    if(!parsed || !Array.isArray(parsed.rows) || !parsed.rows.length) return null;
+    return parsed;
+  } catch(e){
+    console.warn('Não foi possível ler os dados salvos no navegador:', e);
+    return null;
+  }
+}
+
+function clearStorage(){
+  try{ localStorage.removeItem(STORAGE_KEY); } catch(e){ /* ignora */ }
+}
+
+// Mescla linhas novas com as já carregadas. Chave = campanha + dia.
+// Em caso de conflito (mesma campanha no mesmo dia), a nova importação prevalece.
+function mergeRows(existingRows, newRows){
+  const map = new Map();
+  for(const r of existingRows) map.set(r.campanha + '|||' + r.dia, r);
+  for(const r of newRows) map.set(r.campanha + '|||' + r.dia, r);
+  return [...map.values()].sort((a,b)=> a.dia < b.dia ? -1 : a.dia > b.dia ? 1 : 0);
+}
+
+function mergeCapabilities(a, b){
+  const out = {};
+  const keys = new Set([...Object.keys(a||{}), ...Object.keys(b||{})]);
+  keys.forEach(k => { out[k] = !!((a && a[k]) || (b && b[k])); });
+  return out;
+}
+
+const DEFAULT_ACCOUNT_NAME = 'Conta de Anúncios — Demonstração';
+
 /* ---------------- Import CSV ---------------- */
 function handleCsvFile(file){
   Papa.parse(file, {
@@ -2457,18 +2513,25 @@ function handleCsvFile(file){
         showToast('O arquivo foi lido, mas nenhuma linha válida foi encontrada.', true);
         return;
       }
-      STATE.allRows = normalized;
-      STATE.capabilities = capabilities;
-      STATE.accountName = file.name.replace(/\.csv$/i,'');
+
+      const daysBefore = new Set(STATE.allRows.map(r=>r.dia)).size;
+      STATE.allRows = mergeRows(STATE.allRows, normalized);
+      STATE.capabilities = mergeCapabilities(STATE.capabilities, capabilities);
+      if(!STATE.accountName || STATE.accountName === DEFAULT_ACCOUNT_NAME){
+        STATE.accountName = file.name.replace(/\.csv$/i,'');
+      }
       STATE.filters = { week:'all', campanha:'all', objetivo:'all', status:'all', search:'' };
       STATE.compareA = null; STATE.compareB = null;
       renderAll();
+      const daysAfter = new Set(STATE.allRows.map(r=>r.dia)).size;
+      const saved = saveToStorage();
+      updateStorageBadge(saved ? Date.now() : null);
+
       const missing = Object.keys(capabilities).filter(k=>!capabilities[k]);
-      if(missing.length){
-        showToast('CSV importado. Algumas colunas não foram encontradas — certas métricas podem ficar indisponíveis.');
-      } else {
-        showToast('CSV importado com sucesso.');
-      }
+      let msg = `CSV importado e combinado com o histórico existente (${daysAfter} dias no total, +${Math.max(0,daysAfter-daysBefore)} novos).`;
+      if(missing.length) msg += ' Algumas colunas não foram encontradas — certas métricas podem ficar indisponíveis.';
+      if(!saved) msg += ' Atenção: não foi possível salvar no navegador para a próxima visita (modo privado ou armazenamento cheio).';
+      showToast(msg, !saved);
     },
     error: function(){
       showToast('Erro ao ler o arquivo CSV.', true);
@@ -2482,7 +2545,7 @@ function showToast(msg, isError){
   t.querySelector('svg').style.color = isError ? 'var(--negative)' : 'var(--positive)';
   t.classList.add('show');
   clearTimeout(showToast._timer);
-  showToast._timer = setTimeout(()=>t.classList.remove('show'), 3600);
+  showToast._timer = setTimeout(()=>t.classList.remove('show'), 5200);
 }
 
 /* ---------------- Exportação ---------------- */
@@ -2556,7 +2619,39 @@ function wireStaticEvents(){
     renderHeatmap();
   });
 
+  document.getElementById('resetDataBtn').addEventListener('click', ()=>{
+    const ok = confirm('Isso vai apagar os dados importados salvos neste navegador e voltar ao conjunto de demonstração. Deseja continuar?');
+    if(!ok) return;
+    clearStorage();
+    STATE.allRows = fromEmbedded(EMBEDDED_DATASET);
+    STATE.capabilities = {
+      hasCampanha:true, hasConjunto:false, hasAnuncio:false, hasObjetivo:false, hasStatus:true,
+      hasDia:true, hasAlcance:true, hasImpressoes:true, hasFrequencia:true, hasResultados:true,
+      hasValorUsado:true, hasCliques:true, hasCPM:true, hasCPC:true, hasCTR:true, hasROAS:false
+    };
+    STATE.accountName = DEFAULT_ACCOUNT_NAME;
+    STATE.filters = { week:'all', campanha:'all', objetivo:'all', status:'all', search:'' };
+    STATE.compareA = null; STATE.compareB = null;
+    renderAll();
+    updateStorageBadge(null);
+    showToast('Dados restaurados para o conjunto de demonstração.');
+  });
+
   wireCampaignTableSort();
+}
+
+function updateStorageBadge(savedAt){
+  const el = document.getElementById('storageStatusText');
+  if(!el) return;
+  const days = new Set(STATE.allRows.map(r=>r.dia)).size;
+  const camps = new Set(STATE.allRows.map(r=>r.campanha)).size;
+  if(savedAt){
+    const d = new Date(savedAt);
+    const when = d.toLocaleDateString('pt-BR',{day:'2-digit',month:'2-digit'}) + ' às ' + d.toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
+    el.textContent = `${days} dias · ${camps} campanhas · salvo em ${when}`;
+  } else {
+    el.textContent = `${days} dias · ${camps} campanhas neste navegador`;
+  }
 }
 
 function init(){
@@ -2591,8 +2686,18 @@ function init(){
     hasDia:true, hasAlcance:true, hasImpressoes:true, hasFrequencia:true, hasResultados:true,
     hasValorUsado:true, hasCliques:true, hasCPM:true, hasCPC:true, hasCTR:true, hasROAS:false
   };
+  STATE.accountName = DEFAULT_ACCOUNT_NAME;
+
+  const stored = loadFromStorage();
+  if(stored){
+    STATE.allRows = stored.rows;
+    STATE.capabilities = stored.capabilities || STATE.capabilities;
+    STATE.accountName = stored.accountName || DEFAULT_ACCOUNT_NAME;
+  }
+
   wireStaticEvents();
   renderAll();
+  updateStorageBadge(stored ? stored.savedAt : null);
   document.getElementById('bootLoader').style.display = 'none';
 }
 
